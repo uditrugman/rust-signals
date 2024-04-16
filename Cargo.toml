@@ -11,6 +11,7 @@ keywords = ["signal", "reactive", "frp", "futures"]
 categories = ["asynchronous", "concurrency", "data-structures"]
 edition = "2018"
 publish = ["trugman"]
+rust-version = "1.31" # we need this for paste crate
 
 [features]
 default = ["debug", "serde"]
