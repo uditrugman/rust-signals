@@ -33,7 +33,7 @@ impl BroadcasterNotifier {
         // Take this opportunity to GC dead wakers
         lock.retain(|waker| {
             if let Some(waker) = waker.upgrade() {
-                waker.wake(false);
+                waker.wake(false, false);
                 true
 
             } else {

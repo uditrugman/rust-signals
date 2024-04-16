@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 use std::marker::Unpin;
 use std::time::Duration;
 use std::thread::sleep;

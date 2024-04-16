@@ -1,7 +1,10 @@
 #![recursion_limit="128"]
 #![warn(unreachable_pub)]
 // missing_docs
-#![deny(warnings, missing_debug_implementations, macro_use_extern_crate)]
+
+// #![deny(warnings, missing_debug_implementations, macro_use_extern_crate)]
+#![deny(missing_debug_implementations, macro_use_extern_crate)]
+#![allow(unused_imports, dropping_copy_types)]
 
 ///! It is *very highly* recommended to read the tutorial.
 ///! It explains all of the concepts you will need to use Signals effectively.

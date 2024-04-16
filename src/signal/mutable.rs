@@ -2,7 +2,7 @@ use super::Signal;
 use std;
 use std::fmt;
 use std::pin::Pin;
-use std::marker::Unpin;
+use std::marker::{PhantomData, Unpin};
 use std::ops::{Deref, DerefMut};
 // TODO use parking_lot ?
 use std::sync::{Arc, Weak, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -10,10 +10,10 @@ use std::sync::{Arc, Weak, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Poll, Waker, Context};
 
-
 #[derive(Debug)]
 pub(crate) struct ChangedWaker {
     changed: AtomicBool,
+    closed: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -21,11 +21,12 @@ impl ChangedWaker {
     pub(crate) fn new() -> Self {
         Self {
             changed: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
             waker: Mutex::new(None),
         }
     }
 
-    pub(crate) fn wake(&self, changed: bool) {
+    pub(crate) fn wake(&self, changed: bool, closed: bool) {
         let waker = {
             let mut lock = self.waker.lock().unwrap();
 
@@ -33,6 +34,9 @@ impl ChangedWaker {
                 self.changed.store(true, Ordering::SeqCst);
             }
 
+            if closed {
+                self.closed.store(true, Ordering::SeqCst);
+            }
             lock.take()
         };
 
@@ -63,12 +67,11 @@ impl<A> MutableLockState<A> {
         self.signals.push(Arc::downgrade(state));
     }
 
-    fn notify(&mut self, has_changed: bool) {
+    fn notify(&mut self, has_changed: bool, closed: bool) {
         self.signals.retain(|signal| {
             if let Some(signal) = signal.upgrade() {
-                signal.wake(has_changed);
+                signal.wake(has_changed, closed);
                 true
-
             } else {
                 false
             }
@@ -106,10 +109,8 @@ impl<A> MutableSignalState<A> {
                 f(&lock.value)
             };
             Poll::Ready(Some(value))
-
-        } else if self.state.senders.load(Ordering::SeqCst) == 0 {
+        } else if self.waker.closed.load(Ordering::SeqCst) == true {
             Poll::Ready(None)
-
         } else {
             self.waker.set_waker(cx);
             Poll::Pending
@@ -145,7 +146,7 @@ impl<'a, A> Drop for MutableLockMut<'a, A> {
     #[inline]
     fn drop(&mut self) {
         if self.mutated {
-            self.lock.notify(true);
+            self.lock.notify(true, false);
         }
     }
 }
@@ -178,12 +179,16 @@ impl<A> ReadOnlyMutable<A> {
         }
     }
 
+    fn push_waker(&self, waker: &Arc<ChangedWaker>) {
+        if self.0.senders.load(Ordering::SeqCst) != 0 {
+            self.0.lock.write().unwrap().push_signal(waker);
+        }
+    }
+
     fn signal_state(&self) -> MutableSignalState<A> {
         let signal = MutableSignalState::new(self.0.clone());
 
-        if self.0.senders.load(Ordering::SeqCst) != 0 {
-            self.0.lock.write().unwrap().push_signal(&signal.waker);
-        }
+        self.push_waker(&signal.waker);
 
         signal
     }
@@ -235,7 +240,6 @@ impl<A> fmt::Debug for ReadOnlyMutable<A> where A: fmt::Debug {
     }
 }
 
-
 #[repr(transparent)]
 pub struct Mutable<A>(ReadOnlyMutable<A>);
 
@@ -260,7 +264,7 @@ impl<A> Mutable<A> {
 
         let value = std::mem::replace(&mut state.value, value);
 
-        state.notify(true);
+        state.notify(true, false);
 
         value
     }
@@ -271,7 +275,7 @@ impl<A> Mutable<A> {
         let new_value = f(&mut state.value);
         let value = std::mem::replace(&mut state.value, new_value);
 
-        state.notify(true);
+        state.notify(true, false);
 
         value
     }
@@ -283,8 +287,8 @@ impl<A> Mutable<A> {
 
         std::mem::swap(&mut state1.value, &mut state2.value);
 
-        state1.notify(true);
-        state2.notify(true);
+        state1.notify(true, false);
+        state2.notify(true, false);
     }
 
     pub fn set(&self, value: A) {
@@ -292,7 +296,7 @@ impl<A> Mutable<A> {
 
         state.value = value;
 
-        state.notify(true);
+        state.notify(true, false);
     }
 
     pub fn set_if<F>(&self, value: A, f: F) where F: FnOnce(&A, &A) -> bool {
@@ -300,7 +304,7 @@ impl<A> Mutable<A> {
 
         if f(&state.value, &value) {
             state.value = value;
-            state.notify(true);
+            state.notify(true, false);
         }
     }
 
@@ -328,7 +332,7 @@ impl<A> From<A> for Mutable<A> {
     }
 }
 
-impl<A> ::std::ops::Deref for Mutable<A> {
+impl<A> Deref for Mutable<A> {
     type Target = ReadOnlyMutable<A>;
 
     #[inline]
@@ -397,7 +401,7 @@ impl<A> Drop for Mutable<A> {
             let mut lock = state.lock.write().unwrap();
 
             if lock.signals.len() > 0 {
-                lock.notify(false);
+                lock.notify(false, true);
                 // TODO is this necessary ?
                 lock.signals = vec![];
             }
@@ -459,3 +463,283 @@ impl<A: Clone> Signal for MutableSignalCloned<A> {
         self.0.poll_change(cx, |value| value.clone())
     }
 }
+
+// this is used to hide ChangedWaker from the caller because it's private
+#[derive(Debug)]
+pub struct ChangedWakerWrapper<'a>(&'a Arc<ChangedWaker>);
+
+pub trait Compute<A> {
+    fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper);
+    fn compute(&self) -> A;
+}
+
+#[derive(Debug)]
+struct MemoLockState<A> {
+    value: A,
+}
+
+#[derive(Debug)]
+struct MemoState<A, COMPUTE: Compute<A>> {
+    lock: RwLock<MemoLockState<A>>,
+    waker: Arc<ChangedWaker>,
+    compute: COMPUTE,
+}
+
+impl<A, COMPUTE: Compute<A>> MemoState<A, COMPUTE> {
+    fn check_update(&self) {
+        if self.waker.is_changed() {
+            let mut guard = self.lock.write().unwrap();
+            let new_value = self.compute.compute();
+            guard.value = new_value;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Memo<A, COMPUTE: Compute<A>>(Arc<MemoState<A, COMPUTE>>);
+
+impl<A, COMPUTE: Compute<A>> Memo<A, COMPUTE> {
+    pub fn new(compute: COMPUTE) -> Self {
+        let initial_value = compute.compute();
+        let waker = Arc::new(ChangedWaker::new());
+
+        compute.subscribe(&ChangedWakerWrapper(&waker));
+
+        let memo_state = MemoState {
+            lock: RwLock::new(MemoLockState { value: initial_value }),
+            waker,
+            compute,
+        };
+        Self(Arc::new(memo_state))
+    }
+
+    fn signal_state(&self) -> MemoSignalState<A, COMPUTE> {
+        let signal = MemoSignalState::new(self.0.clone());
+
+        self.0.compute.subscribe(&ChangedWakerWrapper(&signal.waker));
+
+        signal
+    }
+}
+
+impl<A, COMPUTE: Compute<A>> Clone for Memo<A, COMPUTE> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Memo(self.0.clone())
+    }
+}
+
+impl<A: Copy, COMPUTE: Compute<A>> Memo<A, COMPUTE> {
+    pub fn get(&self) -> A {
+        self.0.check_update();
+        self.0.lock.read().unwrap().value
+    }
+
+
+    #[inline]
+    pub fn signal(&self) -> MemoSignal<A, COMPUTE> {
+        MemoSignal(self.signal_state())
+    }
+}
+
+impl<A: Clone, COMPUTE: Compute<A>> Memo<A, COMPUTE> {
+    #[inline]
+    pub fn get_cloned(&self) -> A {
+        self.0.check_update();
+        self.0.lock.read().unwrap().value.clone()
+    }
+
+    #[inline]
+    pub fn signal_cloned(&self) -> MemoSignalCloned<A, COMPUTE> {
+        MemoSignalCloned(self.signal_state())
+    }
+}
+
+#[derive(Debug)]
+struct MemoSignalState<A, COMPUTE: Compute<A>> {
+    waker: Arc<ChangedWaker>,
+    // TODO change this to Weak ?
+    state: Arc<MemoState<A, COMPUTE>>,
+}
+
+impl<A, COMPUTE: Compute<A>> MemoSignalState<A, COMPUTE> {
+    fn new(state: Arc<MemoState<A, COMPUTE>>) -> Self {
+        Self {
+            waker: Arc::new(ChangedWaker::new()),
+            state,
+        }
+    }
+
+    fn poll_change<B, F>(&self, cx: &mut Context, f: F) -> Poll<Option<B>> where F: FnOnce(&A) -> B {
+        if self.waker.is_changed() {
+            self.state.check_update();
+            let value = {
+                let lock = self.state.lock.read().unwrap();
+                f(&lock.value)
+            };
+            Poll::Ready(Some(value))
+        } else if self.waker.closed.load(Ordering::SeqCst) == true {
+            Poll::Ready(None)
+        } else {
+            self.waker.set_waker(cx);
+            Poll::Pending
+        }
+    }
+}
+
+// TODO remove it from signals when it's dropped
+#[derive(Debug)]
+#[repr(transparent)]
+#[must_use = "Signals do nothing unless polled"]
+pub struct MemoSignal<A, COMPUTE: Compute<A>>(MemoSignalState<A, COMPUTE>);
+
+impl<A, COMPUTE: Compute<A>> Unpin for MemoSignal<A, COMPUTE> {}
+
+impl<A: Copy, COMPUTE: Compute<A>> Signal for MemoSignal<A, COMPUTE> {
+    type Item = A;
+
+    fn poll_change(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.0.poll_change(cx, |value| *value)
+    }
+}
+
+
+// TODO remove it from signals when it's dropped
+#[derive(Debug)]
+#[must_use = "Signals do nothing unless polled"]
+pub struct MemoSignalRef<A, COMPUTE: Compute<A>, F>(MemoSignalState<A, COMPUTE>, F);
+
+impl<A, COMPUTE: Compute<A>, F> Unpin for MemoSignalRef<A, COMPUTE, F> {}
+
+impl<A, COMPUTE: Compute<A>, B, F> Signal for MemoSignalRef<A, COMPUTE, F> where F: FnMut(&A) -> B {
+    type Item = B;
+
+    fn poll_change(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let state = &this.0;
+        let callback = &mut this.1;
+        state.poll_change(cx, callback)
+    }
+}
+
+
+// TODO it should have a single MutableSignal implementation for both Copy and Clone
+// TODO remove it from signals when it's dropped
+#[derive(Debug)]
+#[repr(transparent)]
+#[must_use = "Signals do nothing unless polled"]
+pub struct MemoSignalCloned<A, COMPUTE: Compute<A>>(MemoSignalState<A, COMPUTE>);
+
+impl<A, COMPUTE: Compute<A>> Unpin for MemoSignalCloned<A, COMPUTE> {}
+
+impl<A: Clone, COMPUTE: Compute<A>> Signal for MemoSignalCloned<A, COMPUTE> {
+    type Item = A;
+
+    // TODO code duplication with MutableSignal::poll
+    fn poll_change(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.0.poll_change(cx, |value| value.clone())
+    }
+}
+
+pub trait Reader<A>: Clone {
+    fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper);
+    fn get(&self) -> A;
+}
+
+impl<A> Reader<A> for ReadOnlyMutable<A> where A: Clone {
+    fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
+        self.push_waker(waker.0);
+    }
+    fn get(&self) -> A {
+        ReadOnlyMutable::get_cloned(self)
+    }
+}
+
+impl<A: Clone, COMPUTE: Compute<A>> Reader<A> for Memo<A, COMPUTE> {
+    fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
+        self.0.compute.subscribe(waker);
+    }
+    fn get(&self) -> A {
+        Memo::get_cloned(self)
+    }
+}
+
+pub trait IntoReader<A: Clone> {
+    type Target: Reader<A>;
+
+    fn get_reader(&self) -> Self::Target;
+}
+
+impl<A: Clone> IntoReader<A> for Mutable<A> {
+    type Target = ReadOnlyMutable<A>;
+
+    fn get_reader(&self) -> Self::Target {
+        self.read_only().clone()
+    }
+}
+
+impl<A: Clone> IntoReader<A> for ReadOnlyMutable<A> {
+    type Target = ReadOnlyMutable<A>;
+
+    fn get_reader(&self) -> Self::Target {
+        self.clone()
+    }
+}
+
+impl<A: Clone, COMPUTE: Compute<A>> IntoReader<A> for Memo<A, COMPUTE> {
+    type Target = Memo<A, COMPUTE>;
+
+    fn get_reader(&self) -> Self::Target {
+        self.clone()
+    }
+}
+
+
+use paste::paste;
+
+macro_rules! create_compute {
+    ($compute_name:expr, $($param:expr),*) => {
+        paste! {
+            #[derive(Debug)]
+            pub struct [<Compute$compute_name>]<R, $([<A$param>], [<I$param>]),*, F>
+                where
+                    $([<A$param>]: Clone, [<I$param>]: IntoReader<[<A$param>]>),*,
+                    F: Fn($([<A$param>]),*) -> R {
+                $([<p$param>]: [<I$param>]::Target, [<phantom$param>]: PhantomData<[<A$param>]>), *,
+                f: F,
+            }
+
+            impl<R, $([<A$param>], [<I$param>]),*, F> [<Compute$compute_name>]<R, $([<A$param>], [<I$param>]),*, F>
+                where
+                    $([<A$param>]: Clone, [<I$param>]: IntoReader<[<A$param>]>),*,
+                    F: Fn($([<A$param>]),*) -> R {
+                pub fn new($([<p$param>]: &[<I$param>]),*, f: F) -> Self {
+                    Self {
+                        $([<p$param>]: [<p$param>].get_reader(), [<phantom$param>]: PhantomData),*,
+                        f,
+                    }
+                }
+            }
+
+            impl<R, $([<A$param>], [<I$param>]),*, F> Compute<R> for [<Compute$compute_name>]<R, $([<A$param>], [<I$param>]),*, F>
+                where
+                    $([<A$param>]: Clone, [<I$param>]: IntoReader<[<A$param>]>),*,
+                    F: Fn($([<A$param>]),*) -> R {
+                fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
+                    $(self.[<p$param>].subscribe(waker));*;
+                }
+
+                fn compute(&self) -> R {
+                    (self.f)($(self.[<p$param>].get()),*,)
+                }
+            }
+        }
+    }
+}
+
+create_compute!(1, 1);
+create_compute!(2, 1, 2);
+create_compute!(3, 1, 2, 3);
+create_compute!(4, 1, 2, 3, 4);
+create_compute!(5, 1, 2, 3, 4, 5);
+
