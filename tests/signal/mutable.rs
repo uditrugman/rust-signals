@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::task::Poll;
 use futures_signals::cancelable_future;
-use futures_signals::signal::{SignalExt, Mutable, channel, Memo, ReadOnlyMutable, Compute1, Compute2};
+use futures_signals::signal::{SignalExt, Mutable, channel, Memo, ReadOnlyMutable, Compute1, Compute2, Reader};
 use crate::util;
 
 
@@ -208,9 +208,52 @@ fn is_from_t() {
 }
 
 #[test]
+fn memo_reader_usize() {
+    let mutable = Mutable::new(10);
+    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
+
+    let mutable_i = mutable.read_only();
+    immutable(mutable, mutable_i, memo);
+
+    fn immutable<I1: Reader<Item=usize>, I2: Reader<Item=usize>>(mutable: Mutable<usize>, mutable_reader: I1, memo_reader: I2) {
+        let memo2 = Memo::new(Compute1::new(&memo_reader, |m| m * 2));
+
+        assert_eq!(mutable_reader.get(), 10);
+        assert_eq!(memo_reader.get(), 20);
+        assert_eq!(memo2.get(), 40);
+
+        let mut mutable_signal = mutable_reader.signal();
+        let mut memo_signal = memo_reader.signal();
+
+        util::with_noop_context(|cx| {
+            assert_eq!(mutable_reader.get(), 10);
+            assert_eq!(memo_reader.get(), 20);
+
+            mutable.set(20);
+            assert_eq!(mutable_reader.get(), 20);
+            assert_eq!(memo_reader.get(), 40);
+
+            assert_eq!(mutable_signal.poll_change_unpin(cx), Poll::Ready(Some(20)));
+            assert_eq!(mutable_signal.poll_change_unpin(cx), Poll::Pending);
+            assert_eq!(memo_signal.poll_change_unpin(cx), Poll::Ready(Some(40)));
+            assert_eq!(memo_signal.poll_change_unpin(cx), Poll::Pending);
+
+            mutable.set(30);
+
+            // here we expect the signal to recompute the memo without depending on the memo to recompute itself
+            assert_eq!(mutable_signal.poll_change_unpin(cx), Poll::Ready(Some(30)));
+            assert_eq!(mutable_signal.poll_change_unpin(cx), Poll::Pending);
+            assert_eq!(memo_signal.poll_change_unpin(cx), Poll::Ready(Some(60)));
+            assert_eq!(memo_signal.poll_change_unpin(cx), Poll::Pending);
+
+        });
+    }
+}
+
+#[test]
 fn memo_from_one_mutable_usize() {
     let mutable = Mutable::new(10);
-    let memo = Memo::new(Compute1::new(&mutable, |m| m * 2));
+    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
 
     let mut memo_signal1 = memo.signal();
     let mut memo_signal2 = memo.signal();
@@ -244,7 +287,7 @@ fn memo_from_one_mutable_usize() {
 #[test]
 fn broadcast_from_memo_from_one_mutable_usize() {
     let mutable = Mutable::new(10);
-    let memo = Memo::new(Compute1::new(&mutable, |m| m * 2));
+    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
 
     let broadcaster = memo.signal().broadcast();
 
@@ -278,10 +321,44 @@ fn broadcast_from_memo_from_one_mutable_usize() {
 }
 
 #[test]
+fn memo_from_one_mutable_string() {
+    let mutable = Mutable::new("a".to_string());
+    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m + "_suffix"));
+
+    let mut memo_signal1 = memo.signal_cloned();
+    let mut memo_signal2 = memo.signal_cloned();
+
+    util::with_noop_context(|cx| {
+        assert_eq!(memo.get_cloned(), "a_suffix");
+
+        mutable.set("b".to_string());
+        assert_eq!(memo.get_cloned(), "b_suffix");
+
+        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(Some("b_suffix".to_string())));
+        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Pending);
+        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(Some("b_suffix".to_string())));
+        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Pending);
+
+        mutable.set("c".to_string());
+
+        // here we expect the signal to recompute the memo without depending on the memo to recompute itself
+        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(Some("c_suffix".to_string())));
+        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Pending);
+        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(Some("c_suffix".to_string())));
+        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Pending);
+
+        drop(mutable);
+
+        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(None));
+        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(None));
+    });
+}
+
+#[test]
 fn memo_from_two_mutables_usize() {
     let mutable1 = Mutable::new(1);
     let mutable2 = Mutable::new(2);
-    let memo = Memo::new(Compute2::new(&mutable1, &mutable2, |m1, m2| m1 + m2));
+    let memo = Memo::new(Compute2::new(&mutable1.read_only(), &mutable2.read_only(), |m1, m2| m1 + m2));
 
     let mut memo_signal1 = memo.signal();
     let mut memo_signal2 = memo.signal();
@@ -320,7 +397,7 @@ fn memo_from_two_mutables_usize() {
 #[test]
 fn memo_from_one_memo_usize() {
     let mutable = Mutable::new(10);
-    let src_memo = Memo::new(Compute1::new(&mutable, |m| m * 2));
+    let src_memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
     let memo = Memo::new(Compute1::new(&src_memo, |m| m * 2));
 
     let mut memo_signal1 = memo.signal();
@@ -355,9 +432,9 @@ fn memo_from_one_memo_usize() {
 #[test]
 fn memo_from_two_memos_usize() {
     let mutable1 = Mutable::new(1);
-    let src_memo1 = Memo::new(Compute1::new(&mutable1, |m| m * 10));
+    let src_memo1 = Memo::new(Compute1::new(&mutable1.read_only(), |m| m * 10));
     let mutable2 = Mutable::new(2);
-    let src_memo2 = Memo::new(Compute1::new(&mutable2, |m| m * 10));
+    let src_memo2 = Memo::new(Compute1::new(&mutable2.read_only(), |m| m * 10));
     let memo = Memo::new(Compute2::new(&src_memo1, &src_memo2, |m1, m2| m1 + m2));
 
     let mut memo_signal1 = memo.signal();
@@ -395,35 +472,32 @@ fn memo_from_two_memos_usize() {
 }
 
 #[test]
-fn memo_from_one_mutable_string() {
-    let mutable = Mutable::new("a".to_string());
-    let memo = Memo::new(Compute1::new(&mutable, |m| m + "_suffix"));
+fn memos_in_struct() {
+    let mutable = Mutable::new(10);
+    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
 
-    let mut memo_signal1 = memo.signal_cloned();
-    let mut memo_signal2 = memo.signal_cloned();
+    struct MemoInStruct<MemoReader: Reader<Item=usize>> {
+        memo: MemoReader,
+        memo_memo: Memo<Compute1<usize, MemoReader>>,
+    }
 
-    util::with_noop_context(|cx| {
-        assert_eq!(memo.get_cloned(), "a_suffix");
+    impl<MemoReader: Reader<Item=usize>> MemoInStruct<MemoReader> {
+        fn new1(memo: MemoReader) -> Self {
+            let memo_memo = Memo::new(Compute1::new(&memo, |m| m * 2));
 
-        mutable.set("b".to_string());
-        assert_eq!(memo.get_cloned(), "b_suffix");
+            Self {
+                memo,
+                memo_memo
+            }
+        }
+    }
 
-        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(Some("b_suffix".to_string())));
-        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Pending);
-        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(Some("b_suffix".to_string())));
-        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Pending);
+    let memo_in_struct = MemoInStruct::new1(memo);
 
-        mutable.set("c".to_string());
+    assert_eq!(memo_in_struct.memo.get(), 20);
+    assert_eq!(memo_in_struct.memo_memo.get(), 40);
 
-        // here we expect the signal to recompute the memo without depending on the memo to recompute itself
-        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(Some("c_suffix".to_string())));
-        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Pending);
-        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(Some("c_suffix".to_string())));
-        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Pending);
-
-        drop(mutable);
-
-        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(None));
-        assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(None));
-    });
+    mutable.set(11);
+    assert_eq!(memo_in_struct.memo.get(), 22);
+    assert_eq!(memo_in_struct.memo_memo.get(), 44);
 }
