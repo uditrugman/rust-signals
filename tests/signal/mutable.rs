@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicUsize};
 use std::task::Poll;
 use futures_signals::cancelable_future;
 use futures_signals::signal::{SignalExt, Mutable, channel, Memo, ReadOnlyMutable, Compute1, Compute2, Reader};
@@ -248,6 +249,28 @@ fn memo_reader_usize() {
 
         });
     }
+}
+
+#[test]
+fn memo_ensure_lazy_compute() {
+    let mutable = Mutable::new(10);
+
+    thread_local! {
+        static MEMO_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    }
+
+    MEMO_COUNTER.set(0);
+
+    let memo = Memo::new(Compute1::new(&mutable.read_only(), |_m| {
+        let value = MEMO_COUNTER.get() + 1;
+        MEMO_COUNTER.set(value);
+        value
+    }));
+
+    mutable.set(20);
+    mutable.set(30);
+
+    assert_eq!(memo.get(), 1);
 }
 
 #[test]

@@ -482,7 +482,7 @@ pub trait Compute {
 
 #[derive(Debug)]
 struct MemoLockState<A> {
-    value: A,
+    value: Option<A>,
 }
 
 struct MemoState<COMPUTE: Compute> {
@@ -492,11 +492,11 @@ struct MemoState<COMPUTE: Compute> {
 }
 
 impl<COMPUTE: Compute> MemoState<COMPUTE> {
-    fn check_update(&self) {
-        if self.waker.is_changed() {
+    fn check_update(&self, force: bool) {
+        if force || self.waker.is_changed() {
             let mut guard = self.lock.write().unwrap();
             let new_value = self.compute.compute();
-            guard.value = new_value;
+            guard.value = Some(new_value);
         }
     }
 }
@@ -512,13 +512,12 @@ pub struct Memo<COMPUTE: Compute>(Arc<MemoState<COMPUTE>>);
 
 impl<COMPUTE: Compute> Memo<COMPUTE> {
     pub fn new(compute: COMPUTE) -> Self {
-        let initial_value = compute.compute();
         let waker = Arc::new(ChangedWaker::new());
 
         compute.subscribe(&ChangedWakerWrapper(&waker));
 
         let memo_state = MemoState {
-            lock: RwLock::new(MemoLockState { value: initial_value }),
+            lock: RwLock::new(MemoLockState { value: None }),
             waker,
             compute,
         };
@@ -543,8 +542,18 @@ impl<COMPUTE: Compute> Clone for Memo<COMPUTE> {
 
 impl<COMPUTE: Compute> Memo<COMPUTE> where COMPUTE::Item: Copy {
     pub fn get(&self) -> COMPUTE::Item {
-        self.0.check_update();
-        self.0.lock.read().unwrap().value
+        self.0.check_update(false);
+        let value = { // this is the scope of the read lock
+            self.0.lock.read().unwrap().value
+        };
+
+        if let Some(value) = value {
+            value
+        } else {
+            self.0.check_update(true);
+            let value = self.0.lock.read().unwrap().value;
+            value.unwrap()
+        }
     }
 
 
@@ -557,8 +566,18 @@ impl<COMPUTE: Compute> Memo<COMPUTE> where COMPUTE::Item: Copy {
 impl<COMPUTE: Compute> Memo<COMPUTE> {
     #[inline]
     pub fn get_cloned(&self) -> COMPUTE::Item {
-        self.0.check_update();
-        self.0.lock.read().unwrap().value.clone()
+        self.0.check_update(false);
+        let value = { // scope of the read lock
+            self.0.lock.read().unwrap().value.clone()
+        };
+
+        if let Some(value) = value {
+            value
+        } else {
+            self.0.check_update(true);
+            let value = self.0.lock.read().unwrap().value.clone();
+            value.unwrap()
+        }
     }
 
     #[inline]
@@ -584,10 +603,19 @@ impl<COMPUTE: Compute> MemoSignalState<COMPUTE> {
 
     fn poll_change<B, F>(&self, cx: &mut Context, f: F) -> Poll<Option<B>> where F: FnOnce(&COMPUTE::Item) -> B {
         if self.waker.is_changed() {
-            self.state.check_update();
+            self.state.check_update(false);
             let value = {
-                let lock = self.state.lock.read().unwrap();
-                f(&lock.value)
+                let lock = { // scope of the read lock
+                    self.state.lock.read().unwrap()
+                };
+                if let Some(value) = &lock.value {
+                    f(value)
+                } else {
+                    self.state.check_update(false);
+                    let lock = self.state.lock.read().unwrap();
+                    let value = lock.value.clone().unwrap();
+                    f(&value)
+                }
             };
             Poll::Ready(Some(value))
         } else if self.waker.closed.load(Ordering::SeqCst) == true {
