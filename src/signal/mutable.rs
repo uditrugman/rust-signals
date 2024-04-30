@@ -722,6 +722,12 @@ impl<A> BaseReader for ReadOnlyMutable<A> where A: Clone {
     }
 }
 
+impl<A> Clone for Box<dyn BoxedReader<Item=A>> where A: Clone + 'static {
+    fn clone(&self) -> Self {
+        self.clone_reader()
+    }
+}
+
 impl<A> BaseReader for Box<dyn BoxedReader<Item=A>> where A: Clone {
     type Item = A;
 
