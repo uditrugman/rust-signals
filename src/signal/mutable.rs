@@ -1,4 +1,4 @@
-use super::Signal;
+use super::{BoxSignal, Signal, SignalExt};
 use std;
 use std::fmt;
 use std::fmt::Formatter;
@@ -10,6 +10,7 @@ use std::sync::{Arc, Weak, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 // TODO use parking_lot ?
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Poll, Waker, Context};
+use crate::signal_map::SignalMap;
 
 #[derive(Debug)]
 pub(crate) struct ChangedWaker {
@@ -635,7 +636,7 @@ pub struct MemoSignal<COMPUTE: Compute>(MemoSignalState<COMPUTE>);
 
 impl<COMPUTE: Compute> Unpin for MemoSignal<COMPUTE> {}
 
-impl<COMPUTE: Compute> Signal for MemoSignal<COMPUTE> where COMPUTE::Item: Copy{
+impl<COMPUTE: Compute> Signal for MemoSignal<COMPUTE> where COMPUTE::Item: Copy {
     type Item = COMPUTE::Item;
 
     fn poll_change(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -681,15 +682,35 @@ impl<COMPUTE: Compute> Signal for MemoSignalCloned<COMPUTE> {
     }
 }
 
-pub trait Reader: Clone {
+pub trait BaseReader {
     type Item: Clone;
 
     fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper);
+
     fn get(&self) -> Self::Item;
-    fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin;
 }
 
-impl<A> Reader for ReadOnlyMutable<A> where A: Clone {
+pub trait Reader: BaseReader + Clone {
+    fn clone_reader(&self) -> Self {
+        self.clone()
+    }
+    // fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper);
+    // fn get(&self) -> Self::Item;
+    fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin;
+    fn boxed(&self) -> Box<dyn BoxedReader<Item=Self::Item>> where Self::Item: 'static;
+}
+
+pub trait BoxedReader: BaseReader {
+    fn clone_reader(&self) -> Box<dyn BoxedReader<Item=Self::Item>> where Self::Item: 'static;
+    // fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper);
+    // fn get(&self) -> Self::Item;
+
+    // fn signal<'a>(&self) -> Pin<Box<dyn Signal<Item = A> + Send + 'a>> where Self: Sized + Send + 'a;
+}
+
+pub type BoxReader<A> = Box<dyn BoxedReader<Item=A>>;
+
+impl<A> BaseReader for ReadOnlyMutable<A> where A: Clone {
     type Item = A;
 
     fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
@@ -699,13 +720,66 @@ impl<A> Reader for ReadOnlyMutable<A> where A: Clone {
     fn get(&self) -> Self::Item where Self::Item: Clone {
         ReadOnlyMutable::get_cloned(self)
     }
+}
+
+impl<A> BaseReader for Box<dyn BoxedReader<Item=A>> where A: Clone {
+    type Item = A;
+
+    fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
+        self.as_ref().subscribe(waker)
+    }
+
+    fn get(&self) -> Self::Item where Self::Item: Clone {
+        self.as_ref().get()
+    }
+}
+
+impl<A> Reader for ReadOnlyMutable<A> where A: Clone {
 
     fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin where Self::Item: Clone {
         ReadOnlyMutable::signal_cloned(self)
     }
+
+    fn boxed(&self) -> Box<dyn BoxedReader<Item=Self::Item>> where Self::Item: 'static {
+        Box::new(BoxedReaderStruct { reader: self.clone() })
+    }
 }
 
-impl<COMPUTE: Compute> Reader for Memo<COMPUTE> {
+#[derive(Debug)]
+pub struct BoxedReaderStruct<A: Clone, R> where R: Reader<Item=A> {
+    reader: R,
+}
+
+impl<A, R> BaseReader for BoxedReaderStruct<A, R> where A: Clone, R: Reader<Item=A> {
+    type Item = A;
+
+    fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
+        self.reader.subscribe(waker)
+    }
+
+    fn get(&self) -> A {
+        self.reader.get()
+    }
+}
+
+impl<A: Clone, R> BoxedReader for BoxedReaderStruct<A, R> where R: Reader<Item=A> {
+    fn clone_reader(&self) -> Box<dyn BoxedReader<Item=A>> where A: 'static {
+        self.reader.boxed()
+    }
+
+    // fn signal<'a>(&self) -> Pin<Box<dyn Signal<Item=A> + Send + 'a>> where Self: Sized + Send + 'a, A: Send {
+    //     // todo!()
+    //     // ReadOnlyMutable::signal_cloned(self).boxed()
+    //     self.reader.signal().boxed()
+    // }
+    //
+    // fn signal<'a>(&self) -> Pin<Box<dyn Signal<Item = A> + Send + 'a>>
+    //     where Self: Sized + Send + 'a {
+    //     ReadOnlyMutable::signal_cloned(self).boxed()
+    // }
+}
+
+impl<COMPUTE: Compute + 'static> BaseReader for Memo<COMPUTE> {
     type Item = COMPUTE::Item;
 
     fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
@@ -716,8 +790,15 @@ impl<COMPUTE: Compute> Reader for Memo<COMPUTE> {
         Memo::get_cloned(self)
     }
 
+}
+
+impl<COMPUTE: Compute + 'static> Reader for Memo<COMPUTE> {
     fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin where Self::Item: Clone {
         Memo::signal_cloned(self)
+    }
+
+    fn boxed(&self) -> Box<dyn BoxedReader<Item=Self::Item>> {
+        Box::new(BoxedReaderStruct { reader: self.clone() })
     }
 }
 
@@ -726,21 +807,21 @@ use paste::paste;
 macro_rules! create_compute {
     ($compute_name:expr, $($param:expr),*) => {
         paste! {
-            pub struct [<Compute$compute_name>]<R, $([<R$param>]: Reader),*> {
+            pub struct [<Compute$compute_name>]<R, $([<R$param>]: BaseReader),*> {
                 $([<p$param>]: [<R$param>]), *,
                 f: Box<dyn Fn($([<R$param>]::Item),*) -> R>,
             }
 
-            impl<R, $([<R$param>]: Reader),*> [<Compute$compute_name>]<R, $([<R$param>]),*> {
-                pub fn new($([<p$param>]: &[<R$param>]),*, f: impl Fn($([<R$param>]::Item),*) -> R + 'static) -> Self {
+            impl<R, $([<R$param>]: BaseReader),*> [<Compute$compute_name>]<R, $([<R$param>]),*> {
+                pub fn new($([<p$param>]: [<R$param>]),*, f: impl Fn($([<R$param>]::Item),*) -> R + 'static) -> Self {
                     Self {
-                        $([<p$param>]: [<p$param>].clone()),*,
+                        $([<p$param>]: [<p$param>]),*,
                         f: Box::new(f),
                     }
                 }
             }
 
-            impl<R: Clone, $([<R$param>]: Reader),*> Compute for [<Compute$compute_name>]<R, $([<R$param>]),*> {
+            impl<R: Clone, $([<R$param>]: BaseReader),*> Compute for [<Compute$compute_name>]<R, $([<R$param>]),*> {
                 type Item = R;
                 fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
                     $(self.[<p$param>].subscribe(waker));*;
@@ -751,7 +832,7 @@ macro_rules! create_compute {
                 }
             }
 
-            impl<R, $([<R$param>]: Reader),*> std::fmt::Debug for [<Compute$compute_name>]<R, $([<R$param>]),*> {
+            impl<R, $([<R$param>]: BaseReader),*> std::fmt::Debug for [<Compute$compute_name>]<R, $([<R$param>]),*> {
                 fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
                     write!(f, "Compute{}()", $compute_name)
                 }
@@ -766,34 +847,3 @@ create_compute!(3, 1, 2, 3);
 create_compute!(4, 1, 2, 3, 4);
 create_compute!(5, 1, 2, 3, 4, 5);
 
-//
-// pub struct Compute1<R, R1: Reader> {
-//     p1: R1,
-//     f: Box<dyn Fn(R1::Item) -> R>,
-// }
-//
-// impl<R, R1: Reader> Compute1<R, R1> {
-//     pub fn new(p1: &R1, f: impl Fn(R1::Item) -> R + 'static) -> Self {
-//         Self {
-//             p1: p1.clone(),
-//             f: Box::new(f),
-//         }
-//     }
-// }
-// impl<R: Clone, R1: Reader> Compute for Compute1<R, R1> {
-//     type Item = R;
-//
-//     fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
-//         self.p1.subscribe(waker);
-//     }
-//
-//     fn compute(&self) -> R {
-//         (self.f)(self.p1.get())
-//     }
-// }
-//
-// impl<R, R1: Reader> fmt::Debug for Compute1<R, R1> {
-//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-//         write!(f, "Compute1()")
-//     }
-// }

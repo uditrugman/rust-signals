@@ -1,8 +1,9 @@
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicUsize};
 use std::task::Poll;
 use futures_signals::cancelable_future;
-use futures_signals::signal::{SignalExt, Mutable, channel, Memo, ReadOnlyMutable, Compute1, Compute2, Reader};
+use futures_signals::signal::{SignalExt, Mutable, channel, Memo, ReadOnlyMutable, Compute1, Compute2, Reader, BoxReader};
 use crate::util;
 
 
@@ -211,13 +212,13 @@ fn is_from_t() {
 #[test]
 fn memo_reader_usize() {
     let mutable = Mutable::new(10);
-    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
+    let memo = Memo::new(Compute1::new(mutable.read_only(), |m| m * 2));
 
     let mutable_i = mutable.read_only();
     immutable(mutable, mutable_i, memo);
 
     fn immutable<I1: Reader<Item=usize>, I2: Reader<Item=usize>>(mutable: Mutable<usize>, mutable_reader: I1, memo_reader: I2) {
-        let memo2 = Memo::new(Compute1::new(&memo_reader, |m| m * 2));
+        let memo2 = Memo::new(Compute1::new(memo_reader.clone(), |m| m * 2));
 
         assert_eq!(mutable_reader.get(), 10);
         assert_eq!(memo_reader.get(), 20);
@@ -246,7 +247,6 @@ fn memo_reader_usize() {
             assert_eq!(mutable_signal.poll_change_unpin(cx), Poll::Pending);
             assert_eq!(memo_signal.poll_change_unpin(cx), Poll::Ready(Some(60)));
             assert_eq!(memo_signal.poll_change_unpin(cx), Poll::Pending);
-
         });
     }
 }
@@ -261,7 +261,7 @@ fn memo_ensure_lazy_compute() {
 
     MEMO_COUNTER.set(0);
 
-    let memo = Memo::new(Compute1::new(&mutable.read_only(), |_m| {
+    let memo = Memo::new(Compute1::new(mutable.read_only(), |_m| {
         let value = MEMO_COUNTER.get() + 1;
         MEMO_COUNTER.set(value);
         value
@@ -276,7 +276,7 @@ fn memo_ensure_lazy_compute() {
 #[test]
 fn memo_from_one_mutable_usize() {
     let mutable = Mutable::new(10);
-    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
+    let memo = Memo::new(Compute1::new(mutable.read_only(), |m| m * 2));
 
     let mut memo_signal1 = memo.signal();
     let mut memo_signal2 = memo.signal();
@@ -310,7 +310,7 @@ fn memo_from_one_mutable_usize() {
 #[test]
 fn broadcast_from_memo_from_one_mutable_usize() {
     let mutable = Mutable::new(10);
-    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
+    let memo = Memo::new(Compute1::new(mutable.read_only(), |m| m * 2));
 
     let broadcaster = memo.signal().broadcast();
 
@@ -346,7 +346,7 @@ fn broadcast_from_memo_from_one_mutable_usize() {
 #[test]
 fn memo_from_one_mutable_string() {
     let mutable = Mutable::new("a".to_string());
-    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m + "_suffix"));
+    let memo = Memo::new(Compute1::new(mutable.read_only(), |m| m + "_suffix"));
 
     let mut memo_signal1 = memo.signal_cloned();
     let mut memo_signal2 = memo.signal_cloned();
@@ -381,7 +381,7 @@ fn memo_from_one_mutable_string() {
 fn memo_from_two_mutables_usize() {
     let mutable1 = Mutable::new(1);
     let mutable2 = Mutable::new(2);
-    let memo = Memo::new(Compute2::new(&mutable1.read_only(), &mutable2.read_only(), |m1, m2| m1 + m2));
+    let memo = Memo::new(Compute2::new(mutable1.read_only(), mutable2.read_only(), |m1, m2| m1 + m2));
 
     let mut memo_signal1 = memo.signal();
     let mut memo_signal2 = memo.signal();
@@ -420,8 +420,8 @@ fn memo_from_two_mutables_usize() {
 #[test]
 fn memo_from_one_memo_usize() {
     let mutable = Mutable::new(10);
-    let src_memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
-    let memo = Memo::new(Compute1::new(&src_memo, |m| m * 2));
+    let src_memo = Memo::new(Compute1::new(mutable.read_only(), |m| m * 2));
+    let memo = Memo::new(Compute1::new(src_memo, |m| m * 2));
 
     let mut memo_signal1 = memo.signal();
     let mut memo_signal2 = memo.signal();
@@ -455,10 +455,10 @@ fn memo_from_one_memo_usize() {
 #[test]
 fn memo_from_two_memos_usize() {
     let mutable1 = Mutable::new(1);
-    let src_memo1 = Memo::new(Compute1::new(&mutable1.read_only(), |m| m * 10));
+    let src_memo1 = Memo::new(Compute1::new(mutable1.read_only(), |m| m * 10));
     let mutable2 = Mutable::new(2);
-    let src_memo2 = Memo::new(Compute1::new(&mutable2.read_only(), |m| m * 10));
-    let memo = Memo::new(Compute2::new(&src_memo1, &src_memo2, |m1, m2| m1 + m2));
+    let src_memo2 = Memo::new(Compute1::new(mutable2.read_only(), |m| m * 10));
+    let memo = Memo::new(Compute2::new(src_memo1, src_memo2, |m1, m2| m1 + m2));
 
     let mut memo_signal1 = memo.signal();
     let mut memo_signal2 = memo.signal();
@@ -497,7 +497,7 @@ fn memo_from_two_memos_usize() {
 #[test]
 fn memos_in_struct() {
     let mutable = Mutable::new(10);
-    let memo = Memo::new(Compute1::new(&mutable.read_only(), |m| m * 2));
+    let memo = Memo::new(Compute1::new(mutable.read_only(), |m| m * 2));
 
     struct MemoInStruct<MemoReader: Reader<Item=usize>> {
         memo: MemoReader,
@@ -506,11 +506,11 @@ fn memos_in_struct() {
 
     impl<MemoReader: Reader<Item=usize>> MemoInStruct<MemoReader> {
         fn new1(memo: MemoReader) -> Self {
-            let memo_memo = Memo::new(Compute1::new(&memo, |m| m * 2));
+            let memo_memo = Memo::new(Compute1::new(memo.clone(), |m| m * 2));
 
             Self {
                 memo,
-                memo_memo
+                memo_memo,
             }
         }
     }
@@ -523,4 +523,74 @@ fn memos_in_struct() {
     mutable.set(11);
     assert_eq!(memo_in_struct.memo.get(), 22);
     assert_eq!(memo_in_struct.memo_memo.get(), 44);
+}
+
+#[test]
+fn boxed_reader_usize() {
+    let mutable = Mutable::new(10);
+
+    let boxed_mutable = mutable.boxed();
+
+    boxed_fn(&boxed_mutable, 10);
+
+    mutable.set(20);
+    boxed_fn(&boxed_mutable, 20);
+
+    fn boxed_fn(r: &BoxReader<i32>, expected_value: i32) {
+        let r1 = r.clone_reader();
+        let v = r.get();
+        let v1 = r1.get();
+
+        assert_eq!(v, expected_value);
+        assert_eq!(v1, expected_value);
+    }
+}
+
+#[test]
+fn boxed_reader_struct() {
+    let mutable_usize = Mutable::new(10);
+
+    #[derive(Clone)]
+    struct SomeStruct {
+        some_data: usize,
+        #[allow(unused)]
+        some_read_only_mutable: ReadOnlyMutable<i32>,
+        #[allow(unused)]
+        some_mutable: Mutable<i32>,
+    }
+
+    let mutable = Mutable::new(Arc::new(SomeStruct {
+        some_data: 10,
+        some_read_only_mutable: mutable_usize.read_only(),
+        some_mutable: mutable_usize,
+    }));
+
+    let memo = Memo::new(Compute1::new(mutable.read_only(), |m| {
+        let mut new_value = m.deref().clone();
+        new_value.some_data = new_value.some_data + 20;
+        Arc::new(new_value)
+    }));
+
+    boxed_fn(mutable.boxed(), 10);
+    boxed_fn(memo.boxed(), 30);
+
+    fn boxed_fn(r: BoxReader<Arc<SomeStruct>>, expect_value: usize) {
+        let r1 = r.clone_reader();
+        let v = r.get();
+        let v1 = r1.get();
+
+        assert_eq!(v.some_data, expect_value);
+        assert_eq!(v1.some_data, expect_value);
+    }
+}
+
+#[test]
+fn memo_from_boxed() {
+    let boxed_mutable = Mutable::new(10).boxed();
+    assert_eq!(boxed_mutable.get(), 10);
+    let memo = Memo::new(Compute1::new(boxed_mutable, |m| {
+        m + 10
+    }));
+    let memo_boxed = memo.boxed();
+    assert_eq!(memo_boxed.get(), 20);
 }
