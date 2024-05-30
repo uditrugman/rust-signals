@@ -696,7 +696,7 @@ pub trait Reader: BaseReader + Clone {
     }
     // fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper);
     // fn get(&self) -> Self::Item;
-    fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin;
+    fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin + Send;
     fn boxed(&self) -> Box<dyn BoxedReader<Item=Self::Item>> where Self::Item: 'static;
 }
 
@@ -706,6 +706,7 @@ pub trait BoxedReader: BaseReader {
     // fn get(&self) -> Self::Item;
 
     // fn signal<'a>(&self) -> Pin<Box<dyn Signal<Item = A> + Send + 'a>> where Self: Sized + Send + 'a;
+    fn signal<'a>(&'a self) -> Pin<Box<dyn Signal<Item=Self::Item> + 'a + Send>> where Self: 'a, Self::Item: 'static;
 }
 
 pub type BoxReader<A> = Box<dyn BoxedReader<Item=A>>;
@@ -770,6 +771,10 @@ impl<A, R> BaseReader for BoxedReaderStruct<A, R> where A: Clone, R: Reader<Item
 impl<A: Clone, R> BoxedReader for BoxedReaderStruct<A, R> where R: Reader<Item=A> {
     fn clone_reader(&self) -> Box<dyn BoxedReader<Item=A>> where A: 'static {
         self.reader.boxed()
+    }
+
+    fn signal<'a>(&'a self) -> Pin<Box<dyn Signal<Item=Self::Item> + 'a + Send>> where Self: 'a, Self::Item: 'static {
+        self.reader.signal().boxed()
     }
 
     // fn signal<'a>(&self) -> Pin<Box<dyn Signal<Item=A> + Send + 'a>> where Self: Sized + Send + 'a, A: Send {

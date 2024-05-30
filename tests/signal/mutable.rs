@@ -582,6 +582,36 @@ fn boxed_reader_struct() {
         assert_eq!(v.some_data, expect_value);
         assert_eq!(v1.some_data, expect_value);
     }
+
+    util::with_noop_context(|cx| {
+        let boxed_memo = memo.boxed();
+        let boxed_usize_memo = Memo::new(Compute1::new(boxed_memo, |a| a.some_data)).boxed();
+        assert_eq!(boxed_usize_memo.get(), 30);
+
+        let mut memo_signal1 = boxed_usize_memo.signal();
+
+        assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(Some(30)));
+        // assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Pending);
+        // assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(Some(300)));
+        // assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Pending);
+        //
+        // mutable1.set(100);
+        // assert_eq!(memo.get(), 1200);
+        // mutable2.set(200);
+        // assert_eq!(memo.get(), 3000);
+        //
+        // // here we expect the signal to recompute the memo without depending on the memo to recompute itself
+        // assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(Some(3000)));
+        // assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Pending);
+        // assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(Some(3000)));
+        // assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Pending);
+        //
+        // drop(mutable1);
+        //
+        // assert_eq!(memo_signal1.poll_change_unpin(cx), Poll::Ready(None));
+        // assert_eq!(memo_signal2.poll_change_unpin(cx), Poll::Ready(None));
+    });
+
 }
 
 #[test]
