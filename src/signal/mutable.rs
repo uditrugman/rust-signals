@@ -509,9 +509,9 @@ impl<COMPUTE: Compute> fmt::Debug for MemoState<COMPUTE> {
 }
 
 #[derive(Debug)]
-pub struct Memo<COMPUTE: Compute>(Arc<MemoState<COMPUTE>>);
+pub struct Memo<COMPUTE: Compute + Send + Sync>(Arc<MemoState<COMPUTE>>);
 
-impl<COMPUTE: Compute> Memo<COMPUTE> {
+impl<COMPUTE: Compute + Send + Sync> Memo<COMPUTE> {
     pub fn new(compute: COMPUTE) -> Self {
         let waker = Arc::new(ChangedWaker::new());
 
@@ -534,14 +534,14 @@ impl<COMPUTE: Compute> Memo<COMPUTE> {
     }
 }
 
-impl<COMPUTE: Compute> Clone for Memo<COMPUTE> {
+impl<COMPUTE: Compute + Send + Sync> Clone for Memo<COMPUTE> {
     #[inline]
     fn clone(&self) -> Self {
         Memo(self.0.clone())
     }
 }
 
-impl<COMPUTE: Compute> Memo<COMPUTE> where COMPUTE::Item: Copy {
+impl<COMPUTE: Compute + Send + Sync> Memo<COMPUTE> where COMPUTE::Item: Copy {
     pub fn get(&self) -> COMPUTE::Item {
         self.0.check_update(false);
         let value = { // this is the scope of the read lock
@@ -564,7 +564,7 @@ impl<COMPUTE: Compute> Memo<COMPUTE> where COMPUTE::Item: Copy {
     }
 }
 
-impl<COMPUTE: Compute> Memo<COMPUTE> {
+impl<COMPUTE: Compute + Send + Sync> Memo<COMPUTE> {
     #[inline]
     pub fn get_cloned(&self) -> COMPUTE::Item {
         self.0.check_update(false);
@@ -682,7 +682,7 @@ impl<COMPUTE: Compute> Signal for MemoSignalCloned<COMPUTE> {
     }
 }
 
-pub trait BaseReader {
+pub trait BaseReader: Send + Sync {
     type Item: Clone;
 
     fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper);
@@ -710,7 +710,7 @@ pub trait BoxedReader: BaseReader {
 
 pub type BoxReader<A> = Box<dyn BoxedReader<Item=A>>;
 
-impl<A> BaseReader for ReadOnlyMutable<A> where A: Clone {
+impl<A> BaseReader for ReadOnlyMutable<A> where A: Clone + Send + Sync {
     type Item = A;
 
     fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
@@ -740,8 +740,7 @@ impl<A> BaseReader for Box<dyn BoxedReader<Item=A>> where A: Clone {
     }
 }
 
-impl<A> Reader for ReadOnlyMutable<A> where A: Clone {
-
+impl<A> Reader for ReadOnlyMutable<A> where A: Clone + Send + Sync {
     fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin where Self::Item: Clone {
         ReadOnlyMutable::signal_cloned(self)
     }
@@ -785,7 +784,7 @@ impl<A: Clone, R> BoxedReader for BoxedReaderStruct<A, R> where R: Reader<Item=A
     // }
 }
 
-impl<COMPUTE: Compute + 'static> BaseReader for Memo<COMPUTE> {
+impl<COMPUTE: Compute + Send + Sync + 'static> BaseReader for Memo<COMPUTE> where COMPUTE::Item: Send + Sync {
     type Item = COMPUTE::Item;
 
     fn subscribe<'a>(&self, waker: &'a ChangedWakerWrapper) {
@@ -795,10 +794,9 @@ impl<COMPUTE: Compute + 'static> BaseReader for Memo<COMPUTE> {
     fn get(&self) -> Self::Item where Self::Item: Clone {
         Memo::get_cloned(self)
     }
-
 }
 
-impl<COMPUTE: Compute + 'static> Reader for Memo<COMPUTE> {
+impl<COMPUTE: Compute + Send + Sync + 'static> Reader for Memo<COMPUTE> where COMPUTE::Item: Send + Sync {
     fn signal(&self) -> impl Signal<Item=Self::Item> + Unpin where Self::Item: Clone {
         Memo::signal_cloned(self)
     }
@@ -815,11 +813,11 @@ macro_rules! create_compute {
         paste! {
             pub struct [<Compute$compute_name>]<R, $([<R$param>]: BaseReader),*> {
                 $([<p$param>]: [<R$param>]), *,
-                f: Box<dyn Fn($([<R$param>]::Item),*) -> R>,
+                f: Box<dyn Fn($([<R$param>]::Item),*) -> R + Send+Sync>,
             }
 
             impl<R, $([<R$param>]: BaseReader),*> [<Compute$compute_name>]<R, $([<R$param>]),*> {
-                pub fn new($([<p$param>]: [<R$param>]),*, f: impl Fn($([<R$param>]::Item),*) -> R + 'static) -> Self {
+                pub fn new($([<p$param>]: [<R$param>]),*, f: impl Fn($([<R$param>]::Item),*) -> R + Send+Sync+'static) -> Self {
                     Self {
                         $([<p$param>]: [<p$param>]),*,
                         f: Box::new(f),

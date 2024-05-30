@@ -594,3 +594,33 @@ fn memo_from_boxed() {
     let memo_boxed = memo.boxed();
     assert_eq!(memo_boxed.get(), 20);
 }
+
+#[test]
+fn test_memo_thread() {
+    #[derive(Clone)]
+    struct MyStruct {
+        a: usize,
+        b: String,
+    }
+
+    let mutable_usize = Mutable::new(10);
+    let mutable_struct = Mutable::new(MyStruct { a: 10, b: "asdf".to_string() });
+    let boxed_mutable = Mutable::new(10).boxed();
+    assert_eq!(boxed_mutable.get(), 10);
+    let memo = Memo::new(Compute1::new(boxed_mutable.clone(), |m| {
+        m + 10
+    }));
+    let memo_boxed = memo.boxed();
+    assert_eq!(memo_boxed.get(), 20);
+
+    use std::thread;
+
+    let handle = thread::spawn(move || {
+        assert_eq!(mutable_usize.get(), 10);
+        assert_eq!(mutable_struct.get_cloned().a, 10);
+        assert_eq!(boxed_mutable.get(), 10);
+        assert_eq!(memo_boxed.get(), 20);
+    });
+
+    handle.join().unwrap(); // block main thread until new thread finishes
+}
